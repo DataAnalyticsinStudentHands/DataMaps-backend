@@ -1,56 +1,95 @@
-var _ = require('underscore');
-var fs = require('fs');
-//var jsonarray = [];
-
-// Import mapping json file to map folder name to siteRef
-var mapping = JSON.parse(fs.readFileSync('folder2siteRef.js', 'utf8'));
+var Async = require('async');
+var Csv = require('csv-streamify');
+var Es = require('event-stream');
+var Fs = require('fs');
+var Mapping = require('./folder2siteRef.json');
 var MongoClient = require('mongodb').MongoClient;
-var today = new Date();
 
-//var yearfolder  = today.getFullYear().toString();
-var dataFolder = '/hnet/incoming/' + today.getFullYear();
+var sourcePath = '/hnet/incoming/' + new Date().getFullYear();
 
-var subfolder = fs.readdirSync(dataFolder);  // read the list of subfolder, which are sites
-var fileList =[];
-var fields=[];
-var tempRecord=null;
-var recordArray = null;
-var jsonarray = [];
-
-MongoClient.connect('mongodb://127.0.0.1:27017/test3', function(err, db) {    
-    if (err) throw err;
-    console.log("Connected to mongodb!");    
-
-    _.forEach(subfolder, function(folder) {
-    	console.log('Reading folder: ' + folder);
-
-    	fileList = fs.readdirSync(dataFolder + '/' + folder); // array of files in a folder
-
-    	for (var z=101; z<=200; z++) { // read only 100 files at a time
-		
-			console.log('Reading file: ' + fileList[z]);		
-	        recordArray = fs.readFileSync(dataFolder+'/'+folder+'/'+fileList[z]).toString().split("\r\n");
-	        for (i in recordArray) {
-	        	recordArray[i] = recordArray[i].split(",");
-	        };
-	        fields = recordArray[0]; // choose the first element of the array to be fields
-	        recordArray.shift(); recordArray.pop(); // remove first and last element
-	        
-			for (i in recordArray) {
-	        	tempRecord = _.object(fields, recordArray[i]);
-				tempRecord['siteRef'] = mapping[folder];
-				tempRecord['epoch'] = parseInt((tempRecord['TheTime'] - 25569) * 86400) + 6*3600;
-	        	jsonarray.push(tempRecord);	
-	        }; 
-			// insert the whole array into the hnet collection	               
-	        db.collection('hnet').insert(jsonarray);	
-
-			jsonarray.length = 0;       // deallocate jsonarray
-			recordArray.length = 0;    // deallocate recordArray
-  		}; 
-	});        
-      db.close();    
+Async.auto({
+  db: function (callback) {
+    console.log('opening db connection');
+    MongoClient.connect('mongodb://localhost:27017/test3', callback);
+  },
+  subDirectory: function (callback) {
+    // read the list of subfolder, which are sites
+    Fs.readdir(sourcePath, callback);
+  },
+  loadData: ['db', 'subDirectory', function (callback, results) {
+    Async.each(results.subDirectory, load(results.db), callback);
+  }],
+  cleanUp: ['db', 'loadData', function (callback, results) {
+    console.log('closing db connection');
+    results.db.close(callback);
+  }]
+}, function (err) {
+  console.log(err || 'Done');
 });
 
+var load = function (db) {
+  return function (directory, callback) {
+    var basePath = sourcePath + '/' + directory;
+    Async.waterfall([
+      function (callback) {
+        Fs.readdir(basePath, callback); // array of files in a directory
+      },
+      function (files, callback) {
+        console.log('loading ' + files.length + ' files from ' + directory);
+        Async.each(files, function (file, callback) {
+          Fs.createReadStream(basePath + '/' + file)
+            .pipe(Csv({objectMode: true, columns: true}))
+            .pipe(transform(directory))
+            .pipe(batch(200))
+            .pipe(insert(db).on('end', callback));
+        }, callback);
+      }
+    ], callback);
+  };
+};
 
+var transform = function (directory) {
+  return Es.map(function (data, callback) {
+    data.siteRef = Mapping[directory];
+    data.epoch = parseInt((data.TheTime - 25569) * 86400) + 6 * 3600;
+    callback(null, data);
+  });
+};
 
+var insert = function (db) {
+  return Es.map(
+    function (data, callback) {
+      if (data.length) {
+        var bulk = db.collection('hnet').initializeUnorderedBulkOp();
+        data.forEach(function (doc) {
+          bulk.insert(doc);
+        });
+        bulk.execute(callback);
+      } else {
+        callback();
+      }
+    }
+  );
+};
+
+var batch = function (batchSize) {
+  batchSize = batchSize || 1000;
+  var batch = [];
+
+  return Es.through(
+    function write (data) {
+      batch.push(data);
+      if (batch.length === batchSize) {
+        this.emit('data', batch);
+        batch = [];
+      }
+    },
+    function end () {
+      if (batch.length) {
+        this.emit('data', batch);
+        batch = [];
+      }
+      this.emit('end');
+    }
+  );
+};
